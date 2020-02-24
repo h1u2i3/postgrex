@@ -1021,11 +1021,12 @@ defmodule Postgrex.Protocol do
 
   defp parse_describe_flush(s, %{mode: :transaction} = status, query) do
     %{buffer: buffer} = s
-    msgs = parse_describe_msgs(query, [msg_flush()])
+    msgs = parse_describe_msgs(query, [msg_sync()])
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, %Query{ref: ref} = query, %{postgres: postgres} = s, buffer} <-
-           recv_parse_describe(s, status, query, buffer) do
+           recv_parse_describe(s, status, query, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
       # lock state with unique query reference as not synced
       {:ok, query, %{s | postgres: {postgres, ref}, buffer: buffer}}
     else
@@ -1047,12 +1048,13 @@ defmodule Postgrex.Protocol do
        ) do
     msgs =
       [msg_query(statement: "SAVEPOINT postgrex_query")] ++
-        parse_describe_msgs(query, [msg_flush()])
+        parse_describe_msgs(query, [msg_sync()])
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, _, %{buffer: buffer} = s} <- recv_transaction(s, status, buffer),
          {:ok, %Query{ref: ref} = query, %{postgres: postgres} = s, buffer} <-
-           recv_parse_describe(s, status, query, buffer) do
+           recv_parse_describe(s, status, query, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
       # lock state with unique query reference as not synced
       {:ok, query, %{s | postgres: {postgres, ref}, buffer: buffer}}
     else
@@ -1135,13 +1137,14 @@ defmodule Postgrex.Protocol do
     %Query{name: name} = query
     %{buffer: buffer} = s
 
-    msgs = [msg_close(type: :statement, name: name)] ++ parse_describe_msgs(query, [msg_flush()])
+    msgs = [msg_close(type: :statement, name: name)] ++ parse_describe_msgs(query, [msg_sync()])
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, s, buffer} <- recv_close(s, status, buffer),
          _ = query_delete(s, query),
          {:ok, %Query{ref: ref} = query, %{postgres: postgres} = s, buffer} <-
-           recv_parse_describe(s, status, query, buffer) do
+           recv_parse_describe(s, status, query, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
       # lock state with unique query reference as not synced
       {:ok, query, %{s | postgres: {postgres, ref}, buffer: buffer}}
     else
@@ -1167,13 +1170,14 @@ defmodule Postgrex.Protocol do
       [
         msg_query(statement: "SAVEPOINT postgrex_query"),
         msg_close(type: :statement, name: name)
-      ] ++ parse_describe_msgs(query, [msg_flush()])
+      ] ++ parse_describe_msgs(query, [msg_sync()])
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, _, %{buffer: buffer} = s} <- recv_transaction(s, status, buffer),
          {:ok, s, buffer} <- recv_close(s, status, buffer),
          {:ok, %Query{ref: ref} = query, %{postgres: postgres} = s, buffer} <-
-           recv_parse_describe(s, status, query, buffer) do
+           recv_parse_describe(s, status, query, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
       # lock state with unique query reference as not synced
       {:ok, query, %{s | postgres: {postgres, ref}, buffer: buffer}}
     else
@@ -1882,6 +1886,9 @@ defmodule Postgrex.Protocol do
 
       {:ok, msg_error(fields: fields), buffer} ->
         {:error, Postgrex.Error.exception(postgres: fields), s, buffer}
+
+      {:ok, msg_ready(), buffer} ->
+        recv_bind(s, status, buffer)
 
       {:ok, msg, buffer} ->
         {s, status} = handle_msg(s, status, msg)
