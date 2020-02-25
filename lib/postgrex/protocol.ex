@@ -967,12 +967,13 @@ defmodule Postgrex.Protocol do
 
     msgs =
       [msg_query(statement: "SAVEPOINT postgrex_query")] ++
-        parse_describe_msgs(query, [msg_query(statement: "RELEASE SAVEPOINT postgrex_query")])
+        parse_describe_msgs(query, [msg_query(statement: "RELEASE SAVEPOINT postgrex_query"), msg_sync()])
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, _, %{buffer: buffer} = s} <- recv_transaction(s, status, buffer),
          {:ok, query, s, buffer} <- recv_parse_describe(s, status, query, buffer),
-         {:ok, _, s} <- recv_transaction(s, status, buffer) do
+         {:ok, _, s} <- recv_transaction(s, status, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
       {:ok, query, s}
     else
       {:reload, oids, s, buffer} ->
@@ -1031,7 +1032,7 @@ defmodule Postgrex.Protocol do
       {:ok, query, %{s | postgres: {postgres, ref}, buffer: buffer}}
     else
       {:error, err, s, buffer} ->
-        error_flushed(s, status, err, buffer)
+        error_ready(s, status, err, buffer)
 
       {:reload, oids, s, buffer} ->
         reload_flushed(s, status, query, oids, buffer)
@@ -1107,14 +1108,15 @@ defmodule Postgrex.Protocol do
         msg_query(statement: "SAVEPOINT postgrex_query"),
         msg_close(type: :statement, name: name)
       ] ++
-        parse_describe_msgs(query, [msg_query(statement: "RELEASE SAVEPOINT postgrex_query")])
+        parse_describe_msgs(query, [msg_query(statement: "RELEASE SAVEPOINT postgrex_query"), msg_sync()])
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, _, %{buffer: buffer} = s} <- recv_transaction(s, status, buffer),
          {:ok, s, buffer} <- recv_close(s, status, buffer),
          _ = query_delete(s, query),
          {:ok, query, s, buffer} <- recv_parse_describe(s, status, query, buffer),
-         {:ok, _, s} <- recv_transaction(s, status, buffer) do
+         {:ok, _, s} <- recv_transaction(s, status, buffer),
+         {:ok, s} <- recv_ready(s, status, buffer) do
       {:ok, query, s}
     else
       {:reload, oids, s, buffer} ->
@@ -1149,7 +1151,7 @@ defmodule Postgrex.Protocol do
       {:ok, query, %{s | postgres: {postgres, ref}, buffer: buffer}}
     else
       {:error, err, s, buffer} ->
-        error_flushed(s, status, err, buffer)
+        error_ready(s, status, err, buffer)
 
       {:reload, oids, s, buffer} ->
         reload_flushed(s, status, query, oids, buffer)
@@ -1247,6 +1249,9 @@ defmodule Postgrex.Protocol do
 
       {:ok, msg_error(fields: fields), buffer} ->
         {:error, Postgrex.Error.exception(postgres: fields), s, buffer}
+
+      {:ok, msg_ready(status: status), buffer} ->
+        recv_parse(s, status, buffer)
 
       {:ok, msg, buffer} ->
         {s, status} = handle_msg(s, status, msg)
@@ -1385,7 +1390,7 @@ defmodule Postgrex.Protocol do
 
   defp rollback_flushed(s, %{mode: :savepoint} = status, err, buffer) do
     stmt = "ROLLBACK TO SAVEPOINT postgrex_query;RELEASE SAVEPOINT postgrex_query"
-    msgs = [msg_sync(), msg_query(statement: stmt)]
+    msgs = [msg_query(statement: stmt), msg_sync()]
 
     with :ok <- msg_send(s, msgs, buffer),
          {:error, err, %{buffer: buffer} = s} <- error_ready(s, status, err, buffer),
@@ -1425,7 +1430,7 @@ defmodule Postgrex.Protocol do
   defp reload_flushed(s, %{mode: :savepoint} = status, query, oids, buffer) do
     %Query{name: name} = query
     stmt = "ROLLBACK TO SAVEPOINT postgrex_query;RELEASE SAVEPOINT postgrex_query"
-    msgs = [msg_close(type: :statement, name: name), msg_query(statement: stmt)]
+    msgs = [msg_close(type: :statement, name: name), msg_query(statement: stmt), msg_sync()]
 
     with :ok <- msg_send(s, msgs, buffer),
          {:ok, s, buffer} <- recv_close(s, status, buffer),
@@ -1801,7 +1806,8 @@ defmodule Postgrex.Protocol do
         result_formats: rfs
       ),
       msg_execute(name_port: "", max_rows: 0),
-      msg_query(statement: "RELEASE SAVEPOINT postgrex_query")
+      msg_query(statement: "RELEASE SAVEPOINT postgrex_query"),
+      msg_sync()
     ]
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
@@ -1855,7 +1861,8 @@ defmodule Postgrex.Protocol do
         result_formats: rfs
       ),
       msg_execute(name_port: "", max_rows: 0),
-      msg_query(statement: "RELEASE SAVEPOINT postgrex_query")
+      msg_query(statement: "RELEASE SAVEPOINT postgrex_query"),
+      msg_sync()
     ]
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
@@ -2054,7 +2061,8 @@ defmodule Postgrex.Protocol do
         params: params,
         result_formats: rfs
       ),
-      msg_query(statement: "RELEASE SAVEPOINT postgrex_query")
+      msg_query(statement: "RELEASE SAVEPOINT postgrex_query"),
+      msg_sync()
     ]
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
@@ -2090,7 +2098,8 @@ defmodule Postgrex.Protocol do
         params: params,
         result_formats: rfs
       ),
-      msg_query(statement: "RELEASE SAVEPOINT postgrex_query")
+      msg_query(statement: "RELEASE SAVEPOINT postgrex_query"),
+      msg_sync()
     ]
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
@@ -2147,7 +2156,8 @@ defmodule Postgrex.Protocol do
     msgs = [
       msg_query(statement: "SAVEPOINT postgrex_query"),
       msg_execute(name_port: portal, max_rows: max_rows),
-      msg_query(statement: "RELEASE SAVEPOINT postgrex_query")
+      msg_query(statement: "RELEASE SAVEPOINT postgrex_query"),
+      msg_sync()
     ]
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
@@ -2457,7 +2467,7 @@ defmodule Postgrex.Protocol do
     %Query{name: name} = query
     %{buffer: buffer} = s
     stmt = "ROLLBACK TO SAVEPOINT postgrex_query;RELEASE SAVEPOINT postgrex_query"
-    msgs = [msg_close(type: :statement, name: name), msg_query(statement: stmt)]
+    msgs = [msg_close(type: :statement, name: name), msg_query(statement: stmt), msg_sync()]
 
     with :ok <- msg_send(%{s | buffer: nil}, msgs, buffer),
          {:ok, s, buffer} <- recv_close(s, status, buffer),
@@ -2539,7 +2549,6 @@ defmodule Postgrex.Protocol do
   end
 
   ## transaction
-
   defp handle_transaction(statement, opts, %{buffer: buffer} = s) do
     status = new_status(opts, mode: :transaction)
     msgs = [msg_query(statement: statement)]
@@ -2569,6 +2578,9 @@ defmodule Postgrex.Protocol do
         s = %{s | postgres: postgres, buffer: buffer}
         {:ok, done(s, status, Enum.reverse(tags)), s}
 
+      {:ok, msg_close_complete(), buffer} ->
+        recv_transaction(s, status, tags, buffer)
+
       {:ok, msg, buffer} ->
         {s, status} = handle_msg(s, status, msg)
         recv_transaction(s, status, tags, buffer)
@@ -2586,6 +2598,9 @@ defmodule Postgrex.Protocol do
       {:ok, msg_error(fields: fields), buffer} ->
         err = Postgrex.Error.exception(postgres: fields)
         {:disconnect, err, %{s | buffer: buffer}}
+
+      {:ok, msg_ready(), buffer} ->
+        recv_close(s, status, buffer)
 
       {:ok, msg, buffer} ->
         {s, status} = handle_msg(s, status, msg)
